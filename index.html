@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>颗粒合成演奏台 · GRAIN INSTRUMENT</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark">G</span>
+          <div>
+            <h1>颗粒合成演奏台</h1>
+            <p>GRAIN INSTRUMENT · sample-accurate granular engine</p>
+          </div>
+        </div>
+        <div class="transport">
+          <button id="playBtn" class="btn primary" type="button">播放</button>
+          <button id="pauseBtn" class="btn" type="button" disabled>暂停</button>
+          <button id="stopBtn" class="btn" type="button" disabled>停止</button>
+          <button id="recBtn" class="btn rec" type="button" disabled>录制</button>
+          <a id="downloadBtn" class="btn ghost disabled" download="grain-recording.wav">下载录音</a>
+        </div>
+        <div class="engine-info" id="engineInfo">
+          <span id="ctxState" class="pill idle">音频引擎待启动</span>
+          <span id="srcState" class="pill">未加载素材</span>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="col left">
+          <div class="panel">
+            <div class="panel-head">
+              <h2>素材 / MATERIAL</h2>
+              <span class="hint">短样本 · 脉冲 / 稳定音 / 短瞬态</span>
+            </div>
+            <div class="material-grid" id="materialGrid">
+              <button class="mat" data-material="impulse" type="button">
+                <span class="mat-name">脉冲</span><span class="mat-sub">IMPULSE</span>
+              </button>
+              <button class="mat" data-material="steady" type="button">
+                <span class="mat-name">稳定音</span><span class="mat-sub">STEADY</span>
+              </button>
+              <button class="mat" data-material="transient" type="button">
+                <span class="mat-name">短瞬态</span><span class="mat-sub">TRANSIENT</span>
+              </button>
+            </div>
+            <label class="file-drop" id="fileDrop">
+              <input id="fileInput" type="file" accept="audio/*" />
+              <span>拖入或选择音频文件（转为单声道）</span>
+            </label>
+            <canvas id="sourceCanvas" class="source-canvas" width="560" height="72"></canvas>
+            <div class="source-meta" id="sourceMeta">素材：— · 长度 — · 采样率 —</div>
+            <div class="policy">
+              <span class="field-label">边缘政策 · EDGE POLICY</span>
+              <div class="segmented" id="boundarySeg">
+                <button data-boundary="clip" class="active" type="button">截取 CLIP</button>
+                <button data-boundary="loop" type="button">循环 LOOP</button>
+              </div>
+              <p class="policy-note" id="policyNote">
+                截取：颗粒被限制在样本内部，必要时缩短时长；读取永不越过样本末尾。
+              </p>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <h2>演奏参数 / PERFORMANCE</h2>
+              <span class="hint">全部参数在音频线程即时生效</span>
+            </div>
+            <div class="controls" id="controls">
+              <label class="control">
+                <span class="control-top"><span>颗粒密度</span><em id="densityVal">24 /s</em></span>
+                <input id="density" type="range" min="1" max="200" step="1" value="24" />
+                <span class="control-foot"><span>稀疏</span><span>密集</span></span>
+              </label>
+              <label class="control">
+                <span class="control-top"><span>颗粒时长</span><em id="durationVal">120 ms</em></span>
+                <input id="duration" type="range" min="10" max="1200" step="5" value="120" />
+              </label>
+              <label class="control">
+                <span class="control-top"><span>时长抖动</span><em id="durJitterVal">28 %</em></span>
+                <input id="durJitter" type="range" min="0" max="90" step="1" value="28" />
+              </label>
+              <label class="control">
+                <span class="control-top"><span>读取速度</span><em id="speedVal">1.00×</em></span>
+                <input id="speed" type="range" min="0.25" max="4" step="0.01" value="1" />
+              </label>
+              <label class="control">
+                <span class="control-top"><span>速度抖动</span><em id="speedJitterVal">6 %</em></span>
+                <input id="speedJitter" type="range" min="0" max="80" step="1" value="6" />
+              </label>
+              <label class="control">
+                <span class="control-top"><span>读取位置</span><em id="positionVal">35 %</em></span>
+                <input id="position" type="range" min="0" max="100" step="1" value="35" />
+              </label>
+              <label class="control">
+                <span class="control-top"><span>位置散布</span><em id="posJitterVal">5 %</em></span>
+                <input id="posJitter" type="range" min="0" max="100" step="1" value="5" />
+              </label>
+              <label class="control">
+                <span class="control-top"><span>立体声展开</span><em id="spreadVal">65 %</em></span>
+                <input id="spread" type="range" min="0" max="100" step="1" value="65" />
+              </label>
+              <label class="control">
+                <span class="control-top"><span>颗粒增益</span><em id="ampVal">42 %</em></span>
+                <input id="amp" type="range" min="0" max="100" step="1" value="42" />
+              </label>
+              <label class="control">
+                <span class="control-top"><span>主输出</span><em id="masterVal">80 %</em></span>
+                <input id="master" type="range" min="0" max="100" step="1" value="80" />
+              </label>
+            </div>
+            <div class="seed-row">
+              <span class="field-label">随机种子</span>
+              <input id="seed" class="seed-input" type="text" inputmode="numeric" value="1371602926" />
+              <button id="seedBtn" class="btn tiny" type="button">换种子</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="col center">
+          <div class="panel continuity-panel">
+            <div class="panel-head">
+              <h2>声音连续性 / CONTINUITY</h2>
+              <span class="hint" id="contHint">实际渲染输出测量</span>
+            </div>
+            <div class="continuity-top">
+              <div class="big-stat">
+                <span class="big-value" id="continuityVal">—</span>
+                <span class="big-label">连续占比</span>
+              </div>
+              <div class="mini-stats">
+                <div><span>最长静音</span><strong id="silentVal">—</strong></div>
+                <div><span>分析窗</span><strong id="windowVal">—</strong></div>
+                <div><span>测量密度</span><strong id="measuredVal">—</strong></div>
+                <div><span>输出峰值</span><strong id="peakVal">—</strong></div>
+              </div>
+            </div>
+            <canvas id="rmsCanvas" class="plot" width="900" height="96"></canvas>
+            <div class="plot-caption"><span>输出 RMS 包络（实时）</span><span>10 ms 分析窗 → 2.5 s 历史</span></div>
+            <canvas id="scopeCanvas" class="scope" width="900" height="110"></canvas>
+            <div class="plot-caption"><span>输出波形</span><span>由音频回调真实数据绘制</span></div>
+            <div class="meter-row">
+              <div class="meter">
+                <span>活动颗粒 <em id="activeVal">0</em> / 池 <em id="capacityVal">220</em></span>
+                <div class="meter-bar"><i id="activeBar"></i></div>
+              </div>
+              <div class="meter">
+                <span>主输出电平</span>
+                <div class="meter-bar"><i id="levelBar" class="level"></i></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel distribution-panel">
+            <div class="panel-head">
+              <h2>颗粒分布 / GRAIN DISTRIBUTION</h2>
+              <span class="hint">按实际触发的每颗颗粒统计</span>
+            </div>
+            <div class="dist-grid">
+              <figure class="dist">
+                <figcaption>触发间隔（ms）<span id="intervalTotal">0</span></figcaption>
+                <div id="intervalHist" class="hist"></div>
+              </figure>
+              <figure class="dist">
+                <figcaption>颗粒时长（ms）<span id="durationTotal">0</span></figcaption>
+                <div id="durationHist" class="hist"></div>
+              </figure>
+              <figure class="dist">
+                <figcaption>立体声位置<span id="panTotal">0</span></figcaption>
+                <div id="panHist" class="hist pan"></div>
+              </figure>
+              <figure class="dist">
+                <figcaption>样本读取位置</figcaption>
+                <div id="positionStrip" class="pos-strip"></div>
+                <div class="pos-axis"><span>0%</span><span>样本</span><span>100%</span></div>
+              </figure>
+            </div>
+          </div>
+        </section>
+
+        <section class="col right">
+          <div class="panel">
+            <div class="panel-head">
+              <h2>活动颗粒 / LIVE GRAINS</h2>
+              <span class="hint">引擎上报的真实声部</span>
+            </div>
+            <canvas id="grainCanvas" class="grain-canvas" width="380" height="220"></canvas>
+            <div class="grain-counts">
+              <div><span>当前</span><strong id="grainNow">0</strong></div>
+              <div><span>峰值</span><strong id="grainPeak">0</strong></div>
+              <div><span>累计</span><strong id="grainSpawned">0</strong></div>
+              <div><span>丢弃</span><strong id="grainDropped">0</strong></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <h2>结果 / RESULTS</h2>
+              <span class="hint">边界、能量与调度</span>
+            </div>
+            <dl class="metrics" id="metrics">
+              <div><dt>窗边界最大值</dt><dd id="metricWindow">—</dd></div>
+              <div><dt>越界读取</dt><dd id="metricOob">—</dd></div>
+              <div><dt>非有限样本</dt><dd id="metricNan">—</dd></div>
+              <div><dt>截取缩短 / 跳过</dt><dd id="metricBoundary">—</dd></div>
+              <div><dt>循环回绕</dt><dd id="metricLoop">—</dd></div>
+              <div><dt>能量归一系数</dt><dd id="metricNorm">—</dd></div>
+              <div><dt>预期重叠数</dt><dd id="metricOverlap">—</dd></div>
+              <div><dt>限幅最大衰减</dt><dd id="metricLimiter">—</dd></div>
+              <div><dt>回调异常</dt><dd id="metricCallbacks">—</dd></div>
+              <div><dt>录音溢出</dt><dd id="metricRecDrop">—</dd></div>
+              <div><dt>读取范围</dt><dd id="metricReadRange">—</dd></div>
+              <div><dt>当前密度峰值 / 声部</dt><dd id="metricDensityPeak">—</dd></div>
+            </dl>
+            <div class="checks" id="checks">
+              <div class="check" id="checkWindow"><span class="chk-name">窗边界归零</span><span class="chk-val">待测</span></div>
+              <div class="check" id="checkCount"><span class="chk-name">颗粒实际数量</span><span class="chk-val">待测</span></div>
+              <div class="check" id="checkPeak"><span class="chk-name">当前密度峰值 &lt; 0.99</span><span class="chk-val">待测</span></div>
+            </div>
+            <div class="anomaly-box">
+              <div class="anomaly-head">
+                <h3>引擎提示</h3>
+                <span id="anomalyCount" class="badge ok">正常</span>
+              </div>
+              <ul id="anomalies" class="anomaly-list">
+                <li class="ok">尚未播放。启动后此处显示由实际运算得到的异常与提示。</li>
+              </ul>
+            </div>
+          </div>
+        </section>
+      </main>
+      <footer class="footer">
+        <span>调度以样本帧为基准，不依赖界面刷新率或块长度。</span>
+        <span id="recStatus">录音：待机</span>
+        <span>有界声部池 · 加窗颗粒 · 能量归一</span>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
