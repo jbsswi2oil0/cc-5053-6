@@ -231,6 +231,90 @@
               </ul>
             </div>
           </div>
+
+          <div class="panel diag-panel">
+            <div class="panel-head">
+              <h2>诊断工作台 / DIAGNOSTICS</h2>
+              <span class="hint">冻结种子 · 撤事件 · 改相位 · 阶段归因</span>
+            </div>
+
+            <div class="diag-section">
+              <span class="field-label">处理开关 · FIX SWITCHES（默认全开 = 正确引擎）</span>
+              <label class="diag-toggle">
+                <input id="fixSourceOverrun" type="checkbox" checked />
+                <span>修正源端越界（clip 截断、读取不越界）</span>
+              </label>
+              <label class="diag-toggle">
+                <input id="fixWindowMix" type="checkbox" checked />
+                <span>修正窗叠加（Hann 相乘 + 全局能量归一）</span>
+              </label>
+            </div>
+
+            <div class="diag-section">
+              <span class="field-label">故障注入 · FAULT INJECTION</span>
+              <label class="diag-toggle">
+                <input id="injectDoubleTrigger" type="checkbox" />
+                <span>同一颗粒触发两次（共享实例号）</span>
+              </label>
+              <label class="diag-toggle">
+                <input id="injectWindowNormError" type="checkbox" />
+                <span>窗归一错误（按窗值倒数加权）</span>
+              </label>
+              <label class="diag-toggle">
+                <input id="injectSourceOverrun" type="checkbox" />
+                <span>源端越界（读取越过样本末尾）</span>
+              </label>
+              <label class="diag-toggle">
+                <input id="seedFrozen" type="checkbox" />
+                <span>冻结随机种子（每次演奏回放同一颗粒流）</span>
+              </label>
+            </div>
+
+            <div class="diag-actions">
+              <button id="diagStartBtn" class="btn tiny" type="button">开启扫描</button>
+              <button id="diagStopBtn" class="btn tiny" type="button">关闭扫描</button>
+            </div>
+
+            <div class="diag-mismatch" id="diagMismatch">
+              <div class="diag-row"><span>独立窗叠加比对</span><strong id="mismatchState">未扫描</strong></div>
+              <div class="diag-row"><span>首个不符帧</span><strong id="mismatchFrame">—</strong></div>
+              <div class="diag-row"><span>偏差 Δ</span><strong id="mismatchDelta">—</strong></div>
+              <div class="diag-row"><span>归因阶段</span><strong id="mismatchStage">—</strong></div>
+              <div class="diag-row"><span>该帧活动实例</span><strong id="mismatchInstances">—</strong></div>
+            </div>
+
+            <div class="diag-section">
+              <span class="field-label">逐项撤事件 / 改相位 · PER-INSTANCE</span>
+              <div class="diag-instance-controls">
+                <input id="instanceId" class="seed-input" type="number" min="1" step="1" placeholder="实例号" />
+                <button id="muteInstanceBtn" class="btn tiny" type="button">静音</button>
+                <button id="unmuteInstanceBtn" class="btn tiny" type="button">恢复</button>
+              </div>
+              <div class="diag-instance-controls">
+                <input id="phaseOffset" class="seed-input" type="number" step="1" placeholder="相位偏移（源帧）" />
+                <button id="applyPhaseBtn" class="btn tiny" type="button">应用相位</button>
+                <button id="clearPhaseBtn" class="btn tiny" type="button">清除</button>
+              </div>
+              <div class="diag-row"><span>已静音实例</span><strong id="mutedList">无</strong></div>
+              <div class="diag-row"><span>相位偏移</span><strong id="phaseList">无</strong></div>
+              <div class="diag-row"><span>重复触发计数</span><strong id="duplicateCount">0</strong></div>
+              <div class="diag-row"><span>抵达末端读取</span><strong id="endReachedCount">0</strong></div>
+            </div>
+
+            <div class="diag-section">
+              <span class="field-label">取证台账（最近颗粒，最新在底）· LEDGER</span>
+              <div class="ledger-wrap">
+                <table class="ledger" id="ledgerTable">
+                  <thead>
+                    <tr>
+                      <th>实例</th><th>提交帧</th><th>源起</th><th>源止</th><th>长度</th><th>速率</th><th>标记</th>
+                    </tr>
+                  </thead>
+                  <tbody id="ledgerBody"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
         </section>
       </main>
       <footer class="footer">

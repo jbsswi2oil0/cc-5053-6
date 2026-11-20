@@ -1,23 +1,21 @@
 import {
+  DEFAULT_DIAGNOSTIC_FLAGS,
   DEFAULT_PARAMS,
   DURATION_EDGES,
   DURATION_LABELS,
+  DiagnosticFlags,
+  GrainEvent,
   GrainParams,
   GrainStats,
   GrainView,
   INTERVAL_EDGES,
   INTERVAL_LABELS,
+  MixMismatch,
   PAN_BINS,
   POSITION_BINS,
 } from './types';
 
-const WINDOW_SIZE = 4097;
-const WT = new Float64Array(WINDOW_SIZE);
-for (let i = 0; i < WINDOW_SIZE; i++) {
-  const x = i / (WINDOW_SIZE - 1);
-  const s = Math.sin(Math.PI * x);
-  WT[i] = s * s;
-}
+import { FADE_SECONDS, windowAt } from './window';
 
 export const ENGINE_LIMITS = {
   maxActive: 220,
@@ -130,7 +128,30 @@ export class GrainEngine {
   private readonly gId = new Uint32Array(this.capacity);
   private readonly gPan = new Float64Array(this.capacity);
   private readonly gDur = new Float64Array(this.capacity);
+  private readonly gInstance = new Uint32Array(this.capacity);
+  private readonly gPhaseOffset = new Float64Array(this.capacity);
+  private readonly gMuted = new Uint8Array(this.capacity);
+  private readonly gDuplicate = new Uint8Array(this.capacity);
+  private readonly gTruncated = new Uint8Array(this.capacity);
   private nextGrainId = 1;
+  private nextInstance = 1;
+
+  private diagnostic: DiagnosticFlags = { ...DEFAULT_DIAGNOSTIC_FLAGS };
+  private frozenRandState: number | null = null;
+  private duplicateSpawns = 0;
+  private endReachedReads = 0;
+  private mutedInstances = new Set<number>();
+  private phaseOffsetByInstance = new Map<number, number>();
+
+  /** Forensic ledger: one entry per spawned grain, ring-buffered. */
+  private readonly eventCapacity = 16384;
+  private readonly eventRing: GrainEvent[] = [];
+  private eventRingStart = 0;
+  private eventRingCount = 0;
+
+  /** Independent per-frame window-sum reference, kept only while diagnosing. */
+  private mismatch: MixMismatch | null = null;
+  private diagnosing = false;
 
   private readonly intervalHistogram = new Array(INTERVAL_LABELS.length).fill(0);
   private readonly durationHistogram = new Array(DURATION_LABELS.length).fill(0);
@@ -177,7 +198,7 @@ export class GrainEngine {
   }
 
   private applyFadeRates(): void {
-    this.fadeStep = 1 / (0.012 * this.sampleRate);
+    this.fadeStep = 1 / (FADE_SECONDS * this.sampleRate);
   }
 
   getSampleRate(): number {
@@ -244,9 +265,118 @@ export class GrainEngine {
     return { ...this.params };
   }
 
+  getDiagnosticFlags(): DiagnosticFlags {
+    return { ...this.diagnostic };
+  }
+
+  setDiagnosticFlags(patch: Partial<DiagnosticFlags>): void {
+    const prev = this.diagnostic;
+    this.diagnostic = { ...prev, ...patch };
+    if (this.diagnostic.seedFrozen && !prev.seedFrozen) {
+      // Capture the live PRNG state: mulberry32's state is the seed it was last
+      // (re)initialised with plus the number of draws, so snapshot via params seed
+      // and let play() rewind; also remember the current numeric state directly.
+      this.frozenRandState = this.params.seed >>> 0;
+    }
+    if (!this.diagnostic.seedFrozen) this.frozenRandState = null;
+    if (this.diagnosing) this.mismatch = null;
+  }
+
+  /** Stops an already spawned (or future) instance from contributing to output. */
+  muteInstance(instance: number): void {
+    this.mutedInstances.add(instance);
+    for (let g = 0; g < this.active; g++) {
+      if (this.gInstance[g] === instance) this.gMuted[g] = 1;
+    }
+    for (const ev of this.eventRing) {
+      if (ev.instance === instance) ev.muted = true;
+    }
+  }
+
+  unmuteInstance(instance: number): void {
+    this.mutedInstances.delete(instance);
+    for (let g = 0; g < this.active; g++) {
+      if (this.gInstance[g] === instance) this.gMuted[g] = 0;
+    }
+    for (const ev of this.eventRing) {
+      if (ev.instance === instance) ev.muted = false;
+    }
+  }
+
+  isInstanceMuted(instance: number): boolean {
+    return this.mutedInstances.has(instance);
+  }
+
+  /** Shifts the source read position of one instance by a signed frame offset. */
+  setInstancePhase(instance: number, offsetFrames: number): void {
+    if (!Number.isFinite(offsetFrames)) return;
+    this.phaseOffsetByInstance.set(instance, offsetFrames);
+    for (let g = 0; g < this.active; g++) {
+      if (this.gInstance[g] === instance) this.gPhaseOffset[g] = offsetFrames;
+    }
+    for (const ev of this.eventRing) {
+      if (ev.instance === instance) ev.phaseOffset = offsetFrames;
+    }
+  }
+
+  clearInstancePhase(instance: number): void {
+    this.phaseOffsetByInstance.delete(instance);
+    for (let g = 0; g < this.active; g++) {
+      if (this.gInstance[g] === instance) this.gPhaseOffset[g] = 0;
+    }
+    for (const ev of this.eventRing) {
+      if (ev.instance === instance) ev.phaseOffset = 0;
+    }
+  }
+
+  getInstancePhase(instance: number): number {
+    return this.phaseOffsetByInstance.get(instance) ?? 0;
+  }
+
+  /** Returns the forensic ledger, newest events last. */
+  getGrainEvents(): GrainEvent[] {
+    const out: GrainEvent[] = [];
+    for (let i = 0; i < this.eventRingCount; i++) {
+      out.push(this.eventRing[(this.eventRingStart + i) % this.eventCapacity]);
+    }
+    return out;
+  }
+
+  getMutedInstances(): number[] {
+    return [...this.mutedInstances].sort((a, b) => a - b);
+  }
+
+  getPhaseOffsets(): { instance: number; offsetFrames: number }[] {
+    return [...this.phaseOffsetByInstance.entries()]
+      .map(([instance, offsetFrames]) => ({ instance, offsetFrames }))
+      .sort((a, b) => a.instance - b.instance);
+  }
+
+  getMixMismatch(): MixMismatch | null {
+    return this.mismatch;
+  }
+
+  /** Enables the independent per-frame window-sum reference and mismatch scan. */
+  startDiagnosis(): void {
+    this.diagnosing = true;
+    this.mismatch = null;
+  }
+
+  stopDiagnosis(): void {
+    this.diagnosing = false;
+  }
+
+  isDiagnosing(): boolean {
+    return this.diagnosing;
+  }
+
   play(): void {
     if (!this.source) return;
     this.resetSession();
+    if (this.diagnostic.seedFrozen) {
+      const frozen = this.frozenRandState ?? this.params.seed;
+      this.rand = mulberry32(frozen >>> 0);
+    }
     this.playing = true;
     this.paused = false;
     this.fade = 0;
@@ -388,6 +518,18 @@ export class GrainEngine {
     this.recordWritten = 0;
     this.recordSent = 0;
     this.recordDropped = false;
+    this.duplicateSpawns = 0;
+    this.endReachedReads = 0;
+    this.mismatch = null;
+    this.eventRing.length = 0;
+    this.eventRingStart = 0;
+    this.eventRingCount = 0;
+    this.nextInstance = 1;
+    this.mutedInstances.clear();
+    this.phaseOffsetByInstance.clear();
+    if (this.diagnostic.seedFrozen && this.frozenRandState !== null) {
+      this.rand = mulberry32(this.frozenRandState);
+    }
   }
 
   /** Power normalisation: energy stays bounded as overlapping grain count grows. */
@@ -396,7 +538,17 @@ export class GrainEngine {
     this.normGain = 1 / Math.sqrt(Math.max(0.75, overlap));
   }
 
-  private spawnGrain(): boolean {
+  private pushGrainEvent(ev: GrainEvent): void {
+    if (this.eventRingCount < this.eventCapacity) {
+      this.eventRing.push(ev);
+      this.eventRingCount++;
+    } else {
+      this.eventRing[this.eventRingStart] = ev;
+      this.eventRingStart = (this.eventRingStart + 1) % this.eventCapacity;
+    }
+  }
+
+  private spawnGrain(committedFrame: number): boolean {
     const src = this.source;
     if (!src || src.length < 4) return false;
     const p = this.params;
@@ -410,26 +562,34 @@ export class GrainEngine {
     );
     const rate = clamp(p.readSpeed * (1 + p.speedJitter * (this.rand() * 2 - 1)), 0.05, 8);
     let len = Math.max(4, Math.round(dur * sr));
+    let truncated = false;
 
     const required = (len - 1) * rate;
     if (required > span) {
-      if (p.boundary === 'clip') {
+      if (p.boundary === 'clip' && this.diagnostic.fixSourceOverrun) {
         len = Math.floor(span / rate) + 1;
         if (len < 4) {
           this.boundarySkipped++;
           return false;
         }
+        truncated = true;
         this.boundaryTruncated++;
       }
     }
 
     const maxStart =
-      p.boundary === 'clip' ? Math.max(0, span - (len - 1) * rate) : Math.max(0, span);
+      p.boundary === 'clip' && this.diagnostic.fixSourceOverrun
+        ? Math.max(0, span - (len - 1) * rate)
+        : Math.max(0, span);
     const center = p.position * maxStart;
     const jitter = p.positionJitter * maxStart;
     let start = clamp(center + (this.rand() * 2 - 1) * jitter, 0, maxStart);
     start = Math.round(start);
-    if (p.boundary === 'clip' && start + (len - 1) * rate > span + 1e-6) {
+    if (
+      p.boundary === 'clip' &&
+      this.diagnostic.fixSourceOverrun &&
+      start + (len - 1) * rate > span + 1e-6
+    ) {
       start = Math.floor(maxStart);
     }
 
@@ -441,39 +601,102 @@ export class GrainEngine {
     const pan = p.spread * (this.rand() * 2 - 1);
     const angle = ((pan + 1) * Math.PI) / 4;
     const gain = p.amplitude * this.normGain;
+    const instance = this.nextInstance++;
+    const committed = this.commitGrain(
+      instance,
+      start,
+      len,
+      rate,
+      pan,
+      gain,
+      truncated,
+      false,
+      src.length,
+      committedFrame,
+    );
+
+    // Double-trigger fault: the same grain parameters are submitted a second
+    // time under the same instance number so telemetry exposes the duplication.
+    if (committed && this.diagnostic.injectDoubleTrigger && this.active < this.capacity) {
+      this.commitGrain(instance, start, len, rate, pan, gain, truncated, true, src.length, committedFrame);
+      this.duplicateSpawns++;
+    }
+    return committed;
+  }
+
+  private commitGrain(
+    instance: number,
+    start: number,
+    len: number,
+    rate: number,
+    pan: number,
+    gain: number,
+    truncated: boolean,
+    duplicate: boolean,
+    sourceLength: number,
+    committedFrame: number,
+  ): boolean {
+    const phaseOffset = this.phaseOffsetByInstance.get(instance) ?? 0;
+    const muted = this.mutedInstances.has(instance) ? 1 : 0;
     const slot = this.active;
     this.gPos[slot] = start;
     this.gStart[slot] = start;
     this.gLen[slot] = len;
     this.gAge[slot] = 0;
     this.gRate[slot] = rate;
-    this.gGainL[slot] = gain * Math.cos(angle) * Math.SQRT2;
-    this.gGainR[slot] = gain * Math.sin(angle) * Math.SQRT2;
+    this.gGainL[slot] = gain * Math.cos(((pan + 1) * Math.PI) / 4) * Math.SQRT2;
+    this.gGainR[slot] = gain * Math.sin(((pan + 1) * Math.PI) / 4) * Math.SQRT2;
     this.gId[slot] = this.nextGrainId++;
     this.gPan[slot] = pan;
-    this.gDur[slot] = len / sr;
+    this.gDur[slot] = len / this.sampleRate;
+    this.gInstance[slot] = instance;
+    this.gPhaseOffset[slot] = phaseOffset;
+    this.gMuted[slot] = muted;
+    this.gDuplicate[slot] = duplicate ? 1 : 0;
+    this.gTruncated[slot] = truncated ? 1 : 0;
     this.active++;
     if (this.active > this.peakActive) this.peakActive = this.active;
     if (this.active > this.densityActivePeak) this.densityActivePeak = this.active;
 
-    this.spawnCount++;
-    this.epochSpawnCount++;
-    if (this.lastSpawnPlayFrame >= 0) {
-      const intervalMs = ((this.playFrame - this.lastSpawnPlayFrame) / this.sampleRate) * 1000;
-      this.intervalHistogram[this.binIndex(INTERVAL_EDGES, intervalMs)]++;
-    }
-    this.lastSpawnPlayFrame = this.playFrame;
-    this.spawnTimes[this.spawnTimeIndex] = this.playFrame;
-    this.spawnTimeIndex = (this.spawnTimeIndex + 1) % this.spawnTimes.length;
-    this.spawnTimeCount++;
+    this.pushGrainEvent({
+      instance,
+      id: this.gId[slot],
+      spawnFrame: committedFrame,
+      sourceStart: start,
+      sourceEnd: start + (len - 1) * rate,
+      sourceLength,
+      length: len,
+      rate,
+      windowPhaseStart: 0,
+      windowPhaseEnd: 1,
+      pan,
+      gainL: this.gGainL[slot],
+      gainR: this.gGainR[slot],
+      normGain: this.normGain,
+      truncated,
+      duplicate,
+      phaseOffset,
+      muted: muted === 1,
+    });
 
-    this.durationHistogram[
-      this.binIndex(DURATION_EDGES, this.gDur[slot] * 1000)
-    ]++;
-    this.panHistogram[Math.min(PAN_BINS - 1, Math.floor(((pan + 1) / 2) * PAN_BINS))]++;
-    this.positionHistogram[
-      Math.min(POSITION_BINS - 1, Math.floor((start / Math.max(1, span)) * POSITION_BINS))
-    ]++;
+    if (!duplicate) {
+      this.spawnCount++;
+      this.epochSpawnCount++;
+      if (this.lastSpawnPlayFrame >= 0) {
+        const intervalMs = ((committedFrame - this.lastSpawnPlayFrame) / this.sampleRate) * 1000;
+        this.intervalHistogram[this.binIndex(INTERVAL_EDGES, intervalMs)]++;
+      }
+      this.lastSpawnPlayFrame = committedFrame;
+      this.spawnTimes[this.spawnTimeIndex] = committedFrame;
+      this.spawnTimeIndex = (this.spawnTimeIndex + 1) % this.spawnTimes.length;
+      this.spawnTimeCount++;
+
+      this.durationHistogram[this.binIndex(DURATION_EDGES, this.gDur[slot] * 1000)]++;
+      this.panHistogram[Math.min(PAN_BINS - 1, Math.floor(((pan + 1) / 2) * PAN_BINS))]++;
+      this.positionHistogram[
+        Math.min(POSITION_BINS - 1, Math.floor((start / Math.max(1, sourceLength - 1)) * POSITION_BINS))
+      ]++;
+    }
     return true;
   }
 
@@ -488,8 +711,10 @@ export class GrainEngine {
     const sr = this.sampleRate;
     const jittered = (sr / this.params.density) * (1 + (this.rand() * 2 - 1) * 0.12);
     const minInterval = (ENGINE_LIMITS.minSpawnIntervalMs / 1000) * sr;
-    const maxInterval = sr / ENGINE_LIMITS.maxSpawnPerSecond;
-    this.nextSpawnFrame += Math.max(minInterval, maxInterval, jittered);
+    const capInterval = sr / ENGINE_LIMITS.maxSpawnPerSecond;
+    // Both limits are minimum spacings (a sub-frame floor and the per-second
+    // spawn cap); the scheduled interval is the desired spacing widened to them.
+    this.nextSpawnFrame += Math.max(minInterval, capInterval, jittered);
   }
 
   private removeGrain(g: number): void {
@@ -505,8 +730,44 @@ export class GrainEngine {
       this.gStart[g] = this.gStart[last];
       this.gPan[g] = this.gPan[last];
       this.gDur[g] = this.gDur[last];
+      this.gInstance[g] = this.gInstance[last];
+      this.gPhaseOffset[g] = this.gPhaseOffset[last];
+      this.gMuted[g] = this.gMuted[last];
+      this.gDuplicate[g] = this.gDuplicate[last];
+      this.gTruncated[g] = this.gTruncated[last];
     }
     this.active--;
+  }
+
+  private windowAt(age: number, len: number): number {
+    return windowAt(age, len);
+  }
+
+  private readSource(pos: number, loop: boolean, srcLen: number): number {
+    if (pos < 0) {
+      this.outOfRangeReads++;
+      pos = 0;
+    }
+    if (pos > srcLen - 1) {
+      if (loop) {
+        pos -= Math.floor(pos / srcLen) * srcLen;
+        this.loopWraps++;
+      } else {
+        this.outOfRangeReads++;
+        pos = srcLen - 1;
+      }
+    }
+    const i0 = pos | 0;
+    const frac = pos - i0;
+    let i1 = i0 + 1;
+    if (i1 >= srcLen) i1 = loop ? 0 : srcLen - 1;
+    const s = this.source![i0] + (this.source![i1] - this.source![i0]) * frac;
+    if (!Number.isFinite(s)) {
+      this.nanSamples++;
+      return 0;
+    }
+    if (i0 >= srcLen - 1) this.endReachedReads++;
+    return s;
   }
 
   private renderRange(outL: Float32Array, outR: Float32Array, from: number, to: number): void {
@@ -520,7 +781,9 @@ export class GrainEngine {
     }
     const srcLen = src.length;
     const loop = this.params.boundary === 'loop';
-    const wtMax = WINDOW_SIZE - 1;
+    const injectNormError = this.diagnostic.injectWindowNormError;
+    const fixWindowMix = this.diagnostic.fixWindowMix;
+    const allowOverrun = this.diagnostic.injectSourceOverrun && !this.diagnostic.fixSourceOverrun;
 
     for (let n = from; n < to; n++) {
       let sumL = 0;
@@ -529,48 +792,45 @@ export class GrainEngine {
       while (g < this.active) {
         const len = this.gLen[g];
         const age = this.gAge[g];
-        let w: number;
-        if (len <= 1) {
-          w = 0;
-        } else {
-          const widx = (age / (len - 1)) * wtMax;
-          const wi0 = widx | 0;
-          const w0 = WT[wi0];
-          const w1 = wi0 < wtMax ? WT[wi0 + 1] : 0;
-          w = w0 + (w1 - w0) * (widx - wi0);
-        }
+        const w = this.windowAt(age, len);
         if (age === 0 || age === len - 1) {
           if (w > this.windowEdgeMax) this.windowEdgeMax = w;
         }
 
-        let pos = this.gPos[g];
-        if (pos < 0) pos = 0;
-        if (pos > srcLen - 1) {
-          if (loop) {
-            pos -= Math.floor(pos / srcLen) * srcLen;
-            this.loopWraps++;
-          } else {
-            this.outOfRangeReads++;
-            pos = srcLen - 1;
-          }
-        }
-        this.gPos[g] = pos;
-        if (pos < this.readPosMin) this.readPosMin = pos;
-        if (pos > this.readPosMax) this.readPosMax = pos;
-
-        const i0 = pos | 0;
-        const frac = pos - i0;
-        let i1 = i0 + 1;
-        if (i1 >= srcLen) i1 = loop ? 0 : srcLen - 1;
-        const s = src[i0] + (src[i1] - src[i0]) * frac;
-        if (!Number.isFinite(s)) {
-          this.nanSamples++;
+        const rawPos = this.gPos[g] + this.gPhaseOffset[g];
+        const overran = rawPos > srcLen - 1 || rawPos < 0;
+        let s: number;
+        let trackedPos: number;
+        if (overran && allowOverrun && !loop) {
+          // Fault path: the read crosses the source end without truncation. The
+          // out-of-bounds region reads as silence instead of a held last sample.
+          this.outOfRangeReads++;
+          if (rawPos > srcLen - 1) this.endReachedReads++;
+          s = 0;
+          trackedPos = Math.max(0, Math.min(rawPos, srcLen - 1));
         } else {
-          sumL += s * this.gGainL[g] * w;
-          sumR += s * this.gGainR[g] * w;
+          s = this.readSource(rawPos, loop, srcLen);
+          trackedPos = rawPos > srcLen - 1 ? srcLen - 1 : rawPos < 0 ? 0 : rawPos;
+        }
+        if (trackedPos < this.readPosMin) this.readPosMin = trackedPos;
+        if (trackedPos > this.readPosMax) this.readPosMax = trackedPos;
+
+        if (!this.gMuted[g]) {
+          let mixW: number;
+          if (fixWindowMix) {
+            mixW = w;
+          } else if (injectNormError) {
+            // Window-normalisation fault: gain is divided by the window value,
+            // flattening every envelope and piling energy into overlap tails.
+            mixW = 1 / Math.max(0.25, w);
+          } else {
+            mixW = w;
+          }
+          sumL += s * this.gGainL[g] * mixW;
+          sumR += s * this.gGainR[g] * mixW;
         }
 
-        this.gPos[g] = pos + this.gRate[g];
+        this.gPos[g] = this.gPos[g] + this.gRate[g];
         this.gAge[g] = age + 1;
         if (age + 1 >= len) {
           this.removeGrain(g);
@@ -580,6 +840,162 @@ export class GrainEngine {
       }
       outL[n] += sumL;
       outR[n] += sumR;
+    }
+  }
+
+  /**
+   * Scans the whole quantum against the independent reference before rendering.
+   * Runs once per process() call so block-internal renderRange splits and the
+   * later fade/limiter stages cannot hide a divergence.
+   */
+  private snapshotGrains(): {
+    id: number;
+    instance: number;
+    pos: number;
+    age: number;
+    len: number;
+    rate: number;
+    gainL: number;
+    phase: number;
+    muted: boolean;
+  }[] {
+    const out = [];
+    for (let g = 0; g < this.active; g++) {
+      out.push({
+        id: this.gId[g],
+        instance: this.gInstance[g],
+        pos: this.gPos[g],
+        age: this.gAge[g],
+        len: this.gLen[g],
+        rate: this.gRate[g],
+        gainL: this.gGainL[g],
+        phase: this.gPhaseOffset[g],
+        muted: this.gMuted[g] === 1,
+      });
+    }
+    return out;
+  }
+
+  private scanReferenceQuantum(
+    frames: number,
+    snapshot: {
+      from: number;
+      to: number;
+      grains: {
+        id: number;
+        instance: number;
+        startPos: number;
+        startAge: number;
+        endPos: number;
+        endAge: number;
+        len: number;
+        rate: number;
+        gainL: number;
+        phase: number;
+        muted: boolean;
+      }[];
+    },
+    rangeOffset: number,
+  ): void {
+    if (!this.diagnosing || this.mismatch || !this.source) return;
+    const faultActive =
+      (this.diagnostic.injectSourceOverrun && !this.diagnostic.fixSourceOverrun) ||
+      (!this.diagnostic.fixWindowMix && this.diagnostic.injectWindowNormError);
+    const fadeOpen = this.fade >= 1 && this.fadeTarget >= 1;
+    if (!faultActive && !fadeOpen) return;
+
+    const live = new Float64Array(frames);
+    const reference = new Float64Array(frames);
+    const activeByFrame: number[][] = new Array(frames);
+
+    for (let n = 0; n < frames; n++) {
+      const activeAtFrame: number[] = [];
+      let liveSum = 0;
+      let refSum = 0;
+      for (const gr of snapshot.grains) {
+        const age = gr.startAge + n;
+        if (age < 0 || age >= gr.len) continue;
+        const w = this.windowAt(age, gr.len);
+        const basePos = gr.startPos + n * gr.rate + gr.phase;
+        const srcLen = this.source.length;
+        const loop = this.params.boundary === 'loop';
+
+        if (gr.muted) continue;
+
+        // Reference: always clamped/looped, correct multiplicative Hann window.
+        let refPos = basePos;
+        if (refPos > srcLen - 1) refPos = loop ? refPos % srcLen : srcLen - 1;
+        else if (refPos < 0) refPos = 0;
+        const ri0 = refPos | 0;
+        const rf = refPos - ri0;
+        let ri1 = ri0 + 1;
+        if (ri1 >= srcLen) ri1 = loop ? 0 : srcLen - 1;
+        const rs = this.source[ri0] + (this.source[ri1] - this.source[ri0]) * rf;
+        refSum += rs * gr.gainL * w;
+
+        activeAtFrame.push(gr.instance);
+
+        // Live path under the currently configured switches/faults.
+        let s: number;
+        let mixW: number;
+        const overran = basePos > srcLen - 1 || basePos < 0;
+        if (overran && this.diagnostic.injectSourceOverrun && !this.diagnostic.fixSourceOverrun && !loop) {
+          s = 0;
+        } else {
+          let p = basePos;
+          if (p > srcLen - 1) p = loop ? p % srcLen : srcLen - 1;
+          else if (p < 0) p = 0;
+          const i0 = p | 0;
+          const frac = p - i0;
+          let i1 = i0 + 1;
+          if (i1 >= srcLen) i1 = loop ? 0 : srcLen - 1;
+          s = this.source[i0] + (this.source[i1] - this.source[i0]) * frac;
+        }
+        if (this.diagnostic.fixWindowMix) mixW = w;
+        else if (this.diagnostic.injectWindowNormError) mixW = 1 / Math.max(0.25, w);
+        else mixW = w;
+        liveSum += s * gr.gainL * mixW;
+      }
+      live[n] = liveSum;
+      reference[n] = refSum;
+      activeByFrame[n] = activeAtFrame;
+    }
+
+    const master = this.params.masterGain;
+    let simFade = this.fade;
+    for (let n = 0; n < frames; n++) {
+      // Healthy comparison includes the same fade/master envelope the live path
+      // applies after rendering; fault scans compare raw sums so any divergence is
+      // attributable to the injected stage rather than the global envelope.
+      if (!faultActive) {
+        if (simFade < this.fadeTarget) simFade = Math.min(this.fadeTarget, simFade + this.fadeStep);
+        else if (simFade > this.fadeTarget) simFade = Math.max(this.fadeTarget, simFade - this.fadeStep);
+        reference[n] *= master * simFade;
+        live[n] *= master * simFade;
+      }
+      const delta = Math.abs(live[n] - reference[n]);
+      // Fault paths use a tight absolute threshold. Healthy comparisons ignore the
+      // first frame of each render range (where a grain may spawn mid-quantum) and
+      // otherwise tolerate relative floating-point/ordering noise.
+      const atRangeEdge = n === 0;
+      const threshold = faultActive ? 2e-3 : Math.max(1e-3, Math.abs(reference[n]) * 0.05);
+      if (!atRangeEdge && delta > threshold) {
+        let stage: MixMismatch['attributedStage'] = 'unknown';
+        if (this.diagnostic.injectSourceOverrun && !this.diagnostic.fixSourceOverrun) {
+          stage = 'source-overrun';
+        } else if (!this.diagnostic.fixWindowMix && this.diagnostic.injectWindowNormError) {
+          stage = 'window-mix';
+        }
+        this.mismatch = {
+          frame: this.frame + rangeOffset + n,
+          delta,
+          live: live[n],
+          reference: reference[n],
+          activeInstances: activeByFrame[n],
+          attributedStage: stage,
+        };
+        return;
+      }
     }
   }
 
@@ -713,12 +1129,35 @@ export class GrainEngine {
       const spawnAllowed = !this.paused && this.fadeTarget > 0;
       if (this.nextSpawnFrame < this.frame) this.nextSpawnFrame = this.frame;
 
+      // Each render range records, per stable grain id, the read position/age at
+      // both the first and last frame of the range. Keying by id makes the
+      // reference immune to the slot swaps the pool performs when grains end.
+      interface GrainFrameState {
+        id: number;
+        instance: number;
+        startPos: number;
+        startAge: number;
+        endPos: number;
+        endAge: number;
+        len: number;
+        rate: number;
+        gainL: number;
+        phase: number;
+        muted: boolean;
+      }
+      interface RangeSnapshot {
+        from: number;
+        to: number;
+        grains: GrainFrameState[];
+      }
+      const snapshots: RangeSnapshot[] = [];
+
       // Interleave spawning and rendering so each grain starts on its exact sample,
       // regardless of how many samples the host delivers per callback.
       let rendered = 0;
       while (rendered < frames) {
         if (spawnAllowed && this.source && this.frame + rendered >= this.nextSpawnFrame) {
-          this.spawnGrain();
+          this.spawnGrain(this.frame + rendered);
           this.scheduleNextSpawn();
           continue;
         }
@@ -728,8 +1167,53 @@ export class GrainEngine {
           if (nextOffset > rendered) chunkEnd = Math.min(frames, nextOffset);
         }
         if (chunkEnd <= rendered) chunkEnd = rendered + 1;
+        const before = this.diagnosing && !this.mismatch ? this.snapshotGrains() : null;
         this.renderRange(outL, outR, rendered, chunkEnd);
+        if (this.diagnosing && !this.mismatch && before && before.length > 0) {
+          const after = this.snapshotGrains();
+          const byId = new Map(after.map((g) => [g.id, g]));
+          const grains: GrainFrameState[] = before.map((b) => {
+            const a = byId.get(b.id);
+            return {
+              id: b.id,
+              instance: b.instance,
+              startPos: b.pos,
+              startAge: b.age,
+              endPos: a ? a.pos : b.pos + (chunkEnd - rendered) * b.rate,
+              endAge: a ? a.age : b.age + (chunkEnd - rendered),
+              len: b.len,
+              rate: b.rate,
+              gainL: b.gainL,
+              phase: b.phase,
+              muted: b.muted,
+            };
+          });
+          // Include grains spawned inside the range (absent from the "before" set).
+          const beforeIds = new Set(before.map((g) => g.id));
+          for (const a of after) {
+            if (!beforeIds.has(a.id)) {
+              grains.push({
+                id: a.id,
+                instance: a.instance,
+                startPos: a.pos,
+                startAge: a.age,
+                endPos: a.pos,
+                endAge: a.age,
+                len: a.len,
+                rate: a.rate,
+                gainL: a.gainL,
+                phase: a.phase,
+                muted: a.muted,
+              });
+            }
+          }
+          snapshots.push({ from: rendered, to: chunkEnd, grains });
+        }
         rendered = chunkEnd;
+      }
+      for (const snap of snapshots) {
+        if (this.mismatch) break;
+        this.scanReferenceQuantum(snap.to - snap.from, snap, snap.from);
       }
       this.applyFadeAndMaster(outL, outR, frames);
 
@@ -844,6 +1328,13 @@ export class GrainEngine {
       recordSeconds: this.recordWritten / sr,
       callbackErrors: this.callbackErrors,
       recordDropped: this.recordDropped,
+      grainEvents: this.getGrainEvents().slice(-256),
+      diagnostic: { ...this.diagnostic },
+      mixMismatch: this.mismatch,
+      mutedInstances: this.getMutedInstances(),
+      phaseOffsets: this.getPhaseOffsets(),
+      duplicateSpawns: this.duplicateSpawns,
+      endReachedReads: this.endReachedReads,
     };
   }
 }

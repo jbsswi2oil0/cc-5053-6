@@ -274,6 +274,31 @@ input[type='range']::-moz-range-thumb { width: 12px; height: 12px; border-radius
 .anomaly-list li.warn { border-left-color: var(--accent-3); }
 .anomaly-list li.bad { border-left-color: var(--danger); color: #ffc3c3; }
 
+/* Diagnostic workbench */
+.diag-panel { border-color: rgba(75, 227, 168, 0.25); }
+.diag-section { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line-soft); display: flex; flex-direction: column; gap: 7px; }
+.diag-toggle { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--ink-dim); cursor: pointer; }
+.diag-toggle input { accent-color: var(--accent); width: 14px; height: 14px; cursor: pointer; }
+.diag-actions { display: flex; gap: 8px; margin-top: 12px; }
+.diag-mismatch { margin-top: 12px; padding: 10px; background: var(--bg-2); border: 1px solid var(--line-soft); border-radius: 8px; display: flex; flex-direction: column; gap: 5px; }
+.diag-row { display: flex; justify-content: space-between; gap: 10px; font-size: 11px; }
+.diag-row span { color: var(--ink-faint); font-family: var(--mono); }
+.diag-row strong { color: var(--ink); font-family: var(--mono); font-weight: 600; text-align: right; word-break: break-all; }
+.diag-row strong.stage-source { color: var(--accent-3); }
+.diag-row strong.stage-window { color: var(--accent-2); }
+.diag-row strong.stage-none { color: var(--accent); }
+.diag-row strong.stage-unknown { color: var(--danger); }
+.diag-instance-controls { display: flex; gap: 6px; align-items: center; }
+.diag-instance-controls .seed-input { flex: 1; min-width: 0; }
+.ledger-wrap { max-height: 220px; overflow: auto; border: 1px solid var(--line-soft); border-radius: 8px; }
+.ledger { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 10px; }
+.ledger th { position: sticky; top: 0; background: var(--panel-2); color: var(--ink-faint); text-align: right; padding: 5px 6px; font-weight: 500; letter-spacing: 0.05em; }
+.ledger th:first-child, .ledger td:first-child { text-align: left; }
+.ledger td { text-align: right; padding: 3px 6px; color: var(--ink-dim); border-top: 1px solid var(--line-soft); white-space: nowrap; }
+.ledger tr.flag-dup td { color: var(--accent-3); }
+.ledger tr.flag-trunc td { color: var(--accent-2); }
+.ledger tr.flag-muted td { color: var(--danger); }
+
 .footer { display: flex; justify-content: space-between; gap: 14px; padding: 15px 4px 6px; font-family: var(--mono); font-size: 9.5px; color: var(--ink-faint); letter-spacing: 0.04em; flex-wrap: wrap; }
 
 @media (max-width: 1280px) {

@@ -1,5 +1,5 @@
 import { GrainEngine } from '../grain/engine';
-import type { GrainParams } from '../grain/types';
+import type { DiagnosticFlags, GrainParams } from '../grain/types';
 
 interface SourcePayload {
   samples: Float32Array;
@@ -15,7 +15,11 @@ type Msg =
   | { type: 'pause' }
   | { type: 'resume' }
   | { type: 'record'; on: boolean }
-  | { type: 'clear' };
+  | { type: 'clear' }
+  | { type: 'diagnostic'; patch: Partial<DiagnosticFlags> }
+  | { type: 'mute-instance'; instance: number; muted: boolean }
+  | { type: 'phase-instance'; instance: number; offsetFrames: number | null }
+  | { type: 'diagnosis'; on: boolean };
 
 const REPORT_EVERY_N_QUANTA = 2;
 
@@ -67,6 +71,21 @@ class GrainEngineProcessor extends AudioWorkletProcessor {
         break;
       case 'clear':
         this.engine.clearSource();
+        break;
+      case 'diagnostic':
+        this.engine.setDiagnosticFlags(msg.patch);
+        break;
+      case 'mute-instance':
+        if (msg.muted) this.engine.muteInstance(msg.instance);
+        else this.engine.unmuteInstance(msg.instance);
+        break;
+      case 'phase-instance':
+        if (msg.offsetFrames === null) this.engine.clearInstancePhase(msg.instance);
+        else this.engine.setInstancePhase(msg.instance, msg.offsetFrames);
+        break;
+      case 'diagnosis':
+        if (msg.on) this.engine.startDiagnosis();
+        else this.engine.stopDiagnosis();
         break;
     }
   }

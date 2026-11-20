@@ -34,10 +34,13 @@ npm run build          # 生产构建
 ```
 src/grain/engine.ts        纯 DSP 引擎（可在 Node 中离线渲染，无 DOM 依赖）
 src/grain/materials.ts     三种内置素材与解码
-src/grain/types.ts         参数、统计、默认值
+src/grain/types.ts         参数、统计、默认值、诊断开关与取证台账类型
+src/grain/window.ts        共享 Hann 窗表与淡入包络（实时渲染与独立参考共用同一份）
+src/grain/diagnostics.ts   确定性回放、独立窗叠加参考、ddmin 最小颗粒集、同相对照
 src/worklet/grain-processor.ts  AudioWorklet 封装：消息、统计上报、录音搬送
 src/main.ts                控制台逻辑：AudioContext、参数同步、录音、WAV 导出
 src/ui/panel.ts            滑杆与按钮绑定
+src/ui/diagnostics-panel.ts     诊断工作台绑定（开关、故障注入、撤事件/改相位、台账）
 src/ui/draw.ts             Canvas 绘制（源波形、RMS、示波、颗粒视图、直方图）
 ```
 
@@ -61,6 +64,52 @@ src/ui/draw.ts             Canvas 绘制（源波形、RMS、示波、颗粒视�
 - 截取政策下，若颗粒按读取速度会越过样本末尾，则缩短颗粒长度；无法缩短到 ≥4 帧时跳过并
   计数。任何情况下读取位置都钳制在 `[0, len-1]`，越界读取与非有限样本分别计数。
 
+## 诊断工作台：区分真实同相增强与生成/混合故障
+
+密度由稀变密时输出忽然变响，单看峰值无法区分三种成因：同相叠加、窗归一错误、同一颗粒被
+触发两次。诊断子系统（界面右侧「诊断工作台 / DIAGNOSTICS」）为此提供可复现的取证流程。
+
+### 取证台账（forensic ledger）
+
+每次提交颗粒都在环形缓冲（16384 条）里记录一条 `GrainEvent`：源样本区间
+（`sourceStart`/`sourceEnd`/`sourceLength`）、窗相位起止、实例号 `instance`、唯一槽位
+`id`、真实提交帧 `spawnFrame`、长度、读取速率、左右增益与捕获时的归一增益，以及 `truncated`
+/`duplicate`/`phaseOffset`/`muted` 标记。双重触发的两份拷贝共享同一 `instance`，因此能从
+台账直接识别重复。`spawnFrame` 记录的是颗粒在量子内的**真实出生帧**（`frame + 量子内偏移`），
+而非块边界，独立参考据此可逐帧重建。
+
+### 冻结种子、逐项撤事件、改相位
+
+- `seedFrozen` 在每次 `play()` 时把 PRNG 倒回冻结的种子，同一段演奏因此逐颗粒可重复。
+- `muteInstance` / `unmuteInstance` 按实例号撤回事件（双重触发的两份拷贝一并静音），并回写
+  台账的 `muted` 标记。
+- `setInstancePhase` 给单个实例施加带符号的源帧相位偏移，用于检验偏移是否消除同相峰。
+
+### 两个独立处理开关 + 三种故障注入
+
+修复开关默认全开（即正确引擎），可分别关闭以隔离阶段：
+
+- `fixSourceOverrun`：仅管源端——clip 截断、读取钳制在样本内。
+- `fixWindowMix`：仅管混合——Hann 窗相乘叠加 + 全局功率归一。
+
+故障注入：`injectDoubleTrigger`（同实例二次提交）、`injectWindowNormError`（按窗值倒数加权，
+把能量堆进重叠尾部）、`injectSourceOverrun`（读取越过样本末尾，越界段读作静默）。
+
+### 独立窗叠加参考与阶段归因
+
+`diagnostics.ts` 的 `independentWindowSum` 只凭台账、用与实时渲染**完全相同**的共享 Hann 窗表
+（`window.ts`）和相同淡入包络逐帧重建输出，不触碰任何实时混合代码。引擎在每个渲染区间按稳定
+颗粒 id 做快照，把实时和与参考和逐帧比较，越过阈值即记录首个不符帧、偏差量、该帧活动实例，并
+依据当前激活的故障把它归给 `source-overrun` 或 `window-mix`。只开窗叠加修复无法消除源端越界，
+反之亦然，因此相似的响度变化会被归到不同阶段。
+
+### 最小颗粒集（delta debugging）与同相对照
+
+`findMinimalGrainSet` 用 ddmin 反复二分实例集合，保留仍能复现异常的最小子集（每次回放都是一次
+全新的确定性演奏）。`coherentSummationUplift` 比较散布读取的普通云与所有颗粒钉在同一位置/速率
+的同相云，量化真实同相叠加带来的 RMS 增益——这部分响度是**应当保留的控制**，且不会触发任何
+混合不符。
+
 ## 测试覆盖
 
 单元测试（`tests/engine.test.ts`、`tests/audioquality.test.ts`）驱动真实引擎：
@@ -73,9 +122,15 @@ src/ui/draw.ts             Canvas 绘制（源波形、RMS、示波、颗粒视�
 - 录音仅包含真实输出并可完整取出；
 - 输出无爆音（相邻样本差有界）、无直流偏置。
 
-端到端测试（`tests/e2e/console.spec.ts`）在真实浏览器里驱动界面与 AudioWorklet：
-播放、密度滑杆改变实测密度、暂停/恢复、无 rAF 时仍推进、录制并产出可下载 WAV、
-极端参数无异常、切换素材与边缘政策。
+诊断单元测试（`tests/diagnostics.test.ts`，离线确定性渲染）覆盖：台账字段与实例唯一性、统计
+台账 256 条上限、冻结种子可重复、逐实例静音/相位 API、独立窗叠加与实时渲染逐帧一致、窗归一
+故障的响度抬升与单开关修复、双重触发的共享实例与一并静音、短源上的 clip 截断与越界归因、两个
+开关分别回放的阶段归因、ddmin 最小颗粒集、以及噪声源上保留的同相增强对照。
+
+端到端测试（`tests/e2e/console.spec.ts`、`tests/e2e/diagnostics.spec.ts`）在真实浏览器里驱动
+界面与 AudioWorklet：前者验证播放、密度滑杆、暂停/恢复、无 rAF 推进、录音 WAV、极端参数与素材/
+边缘政策；后者验证冻结种子回放、撤事件/改相位、双重触发计数、窗故障与源越界的独立开关归因，
+以及实时拖动密度时真实同相增强（无不符）与窗混合故障（报告 `window-mix`）的区分。
 
 ## 已知边界
 

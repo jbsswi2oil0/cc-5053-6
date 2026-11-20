@@ -3,6 +3,8 @@ import type { MaterialId } from './grain/types';
 import { GrainEngine } from './grain/engine';
 import { DEFAULT_PARAMS, GrainParams, GrainStats } from './grain/types';
 import { createPanel } from './ui/panel';
+import { createDiagnosticPanel, renderDiagnosticPanel } from './ui/diagnostics-panel';
+import type { DiagnosticFlags } from './grain/types';
 import { drawGrainView, drawHistograms, drawPositionStrip, drawRmsHistory, drawScope, drawSource } from './ui/draw';
 
 import workletUrl from './worklet/grain-processor.ts?worker&url';
@@ -40,6 +42,12 @@ class GrainConsole {
   private finalized = false;
   private recordedChunks: RecordedChunk[] = [];
   private panelRefs = createPanelRefs();
+  private diagRefs = createDiagnosticPanel({
+    postDiagnostic: (patch) => this.postDiagnostic(patch),
+    postMuteInstance: (instance, muted) => this.postMuteInstance(instance, muted),
+    postPhaseInstance: (instance, offsetFrames) => this.postPhaseInstance(instance, offsetFrames),
+    postDiagnosis: (on) => this.postDiagnosis(on),
+  });
 
   private playBtn = document.getElementById('playBtn') as HTMLButtonElement;
   private pauseBtn = document.getElementById('pauseBtn') as HTMLButtonElement;
@@ -82,6 +90,22 @@ class GrainConsole {
     if (this.node) this.node.port.postMessage({ type: 'params', params: { ...this.params } });
   }
 
+  postDiagnostic(patch: Partial<DiagnosticFlags>): void {
+    this.node?.port.postMessage({ type: 'diagnostic', patch });
+  }
+
+  postMuteInstance(instance: number, muted: boolean): void {
+    this.node?.port.postMessage({ type: 'mute-instance', instance, muted });
+  }
+
+  postPhaseInstance(instance: number, offsetFrames: number | null): void {
+    this.node?.port.postMessage({ type: 'phase-instance', instance, offsetFrames });
+  }
+
+  postDiagnosis(on: boolean): void {
+    this.node?.port.postMessage({ type: 'diagnosis', on });
+  }
+
   private async ensureEngine(): Promise<AudioContext> {
     if (this.ctx) {
       if (this.ctx.state === 'suspended') await this.ctx.resume();
@@ -112,6 +136,14 @@ class GrainConsole {
       sampleRate: this.ctx?.sampleRate ?? 48000,
       name: this.source.name,
     });
+  }
+
+  /** Test-only: replace the source with a caller-provided (e.g. very short) buffer. */
+  async loadTestSource(samples: Float32Array, name = 'test-short'): Promise<void> {
+    const ctx = await this.ensureEngine();
+    this.source = { samples, name, id: 'file' };
+    this.node?.port.postMessage({ type: 'load', samples, sampleRate: ctx.sampleRate, name });
+    this.updateSourceView();
   }
 
   private setCtxState(state: string): void {
@@ -394,6 +426,7 @@ class GrainConsole {
     this.renderMetrics(stats, panel);
     this.renderAnomalies(stats, panel);
     this.renderFooter(stats);
+    renderDiagnosticPanel(this.diagRefs, stats);
   }
 
   private renderMetrics(stats: GrainStats, panel: ReturnType<typeof createPanelRefs>): void {

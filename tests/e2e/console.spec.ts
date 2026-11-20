@@ -1,25 +1,9 @@
 import { expect, test } from '@playwright/test';
+import type { DiagnosticFlags, GrainStats, MixMismatch } from '../../src/grain/types';
 
-interface Stats {
-  playing: boolean;
-  paused: boolean;
-  spawnCount: number;
-  measuredDensity: number;
-  requestedDensity: number;
-  currentActive: number;
-  peakActive: number;
-  capacity: number;
-  dropped: number;
-  outOfRangeReads: number;
-  nanSamples: number;
-  windowEdgeMax: number;
-  renderedFrames: number;
-  continuity: number;
-  analysisWindows: number;
-  recordFrames: number;
-  sampleRate: number;
-  peak: number;
-  sessionSeconds: number;
+interface Stats extends GrainStats {
+  diagnostic: DiagnosticFlags;
+  mixMismatch: MixMismatch | null;
 }
 
 declare global {
@@ -30,6 +14,11 @@ declare global {
         setParam(key: string, value: number | string): void;
         play(): Promise<void>;
         stop(): Promise<void>;
+        postDiagnostic(patch: Partial<DiagnosticFlags>): void;
+        postMuteInstance(instance: number, muted: boolean): void;
+        postPhaseInstance(instance: number, offsetFrames: number | null): void;
+        postDiagnosis(on: boolean): void;
+        loadTestSource(samples: Float32Array, name?: string): Promise<void>;
       };
     };
   }
